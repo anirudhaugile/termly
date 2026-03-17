@@ -12,7 +12,7 @@ load_dotenv()
 
 
 # ─────────────────────────────────────────
-# HTML / MHTML Text Extractor
+# Text Extractors
 # ─────────────────────────────────────────
 class HTMLTextExtractor(HTMLParser):
     def __init__(self):
@@ -38,29 +38,25 @@ class HTMLTextExtractor(HTMLParser):
         return '\n'.join(self.text)
 
 
-# ─────────────────────────────────────────
-# File readers
-# ─────────────────────────────────────────
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(path):
     text = ""
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+            t = page.extract_text()
+            if t:
+                text += t + "\n"
     return text
 
 
 def extract_text_from_html(path):
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         html = f.read()
-    extractor = HTMLTextExtractor()
-    extractor.feed(html)
-    return extractor.get_text()
+    e = HTMLTextExtractor()
+    e.feed(html)
+    return e.get_text()
 
 
 def extract_text_from_mhtml(path):
-    """Extract text from .mhtml (web archive) files."""
     with open(path, 'rb') as f:
         msg = email.message_from_bytes(f.read())
     html = ''
@@ -69,63 +65,53 @@ def extract_text_from_mhtml(path):
             payload = part.get_payload(decode=True)
             if payload:
                 html += payload.decode('utf-8', errors='ignore')
-    extractor = HTMLTextExtractor()
-    extractor.feed(html)
-    return extractor.get_text()
+    e = HTMLTextExtractor()
+    e.feed(html)
+    return e.get_text()
 
 
 def extract_text(file_path):
     ext = file_path.lower()
-    if ext.endswith('.mhtml') or ext.endswith('.mht'):
+    if ext.endswith(('.mhtml', '.mht')):
         return extract_text_from_mhtml(file_path)
-    elif ext.endswith('.html') or ext.endswith('.htm'):
+    elif ext.endswith(('.html', '.htm')):
         return extract_text_from_html(file_path)
     else:
         return extract_text_from_pdf(file_path)
 
 
 # ─────────────────────────────────────────
-# Smart text chunking
-# Sends the most relevant portions to Claude
-# rather than a raw truncation
+# Smart chunking — head + tail + keywords
+# Exam dates are almost always near the END
+# of a syllabus, so we must include the tail
 # ─────────────────────────────────────────
-def smart_chunk(text, max_chars=8000):
-    """
-    Prioritize lines that likely contain dates, grades, or assignment info.
-    Always include grading section + schedule section in full.
-    """
-    lines = text.split('\n')
-    high_priority = []
-    normal = []
+def smart_chunk(text, max_chars=12000):
+    # Always include: first 3000 chars (course info, grading weights)
+    # + last 4000 chars (schedule, exam dates — almost always at end)
+    # + middle keyword lines (anything with dates/assignment keywords)
 
-    date_re = re.compile(
-        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s.,]+\d{1,2}'
-        r'|\d{1,2}/\d{1,2}'
-        r'|\bweek\s+\d+\b',
-        re.IGNORECASE
-    )
+    head = text[:3000]
+    tail = text[-4000:] if len(text) > 4000 else ''
+
     keyword_re = re.compile(
-        r'\b(exam|quiz|midterm|final|project|lab|assignment|hwk|homework|due|paper|'
-        r'presentation|test|percent|%|points|grading|schedule)\b',
+        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*'
+        r'|\d{1,2}/\d{1,2}'
+        r'|\bweek\s*\d+\b'
+        r'|\b(exam|quiz|midterm|final|project|lab|assignment|homework|due|paper|presentation|test)\b',
         re.IGNORECASE
     )
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        if date_re.search(line) or keyword_re.search(line):
-            high_priority.append(line)
-        else:
-            normal.append(line)
+    middle_lines = []
+    middle_text = text[3000:max(3000, len(text)-4000)]
+    for line in middle_text.split('\n'):
+        if keyword_re.search(line) and len(line.strip()) > 5:
+            middle_lines.append(line.strip())
 
-    # Build chunk: high priority first, fill remainder with normal
-    result = '\n'.join(high_priority)
-    if len(result) < max_chars:
-        remaining = max_chars - len(result)
-        result += '\n' + '\n'.join(normal)[:remaining]
+    middle = '\n'.join(middle_lines)
 
-    return result[:max_chars]
+    # Combine, deduplicate
+    combined = head + '\n\n--- MIDDLE KEY LINES ---\n' + middle + '\n\n--- END OF SYLLABUS ---\n' + tail
+    return combined[:max_chars]
 
 
 # ─────────────────────────────────────────
@@ -138,22 +124,21 @@ def ai_parse_syllabus(text, course_name, default_year=2026):
 
     prompt = f"""You are an expert academic syllabus parser. Extract every graded deadline from this syllabus for the course "{course_name}".
 
-Return ONLY a raw JSON array — no markdown, no explanation, no code fences. Just the array.
+Return ONLY a raw JSON array — no markdown, no explanation, no code fences.
 
 Each object must have exactly these fields:
-- "date": the DEADLINE date as "Mon DD" (e.g. "Feb 26"). For date ranges use the CLOSING/DUE date.
+- "date": the DEADLINE date as "Mon DD" e.g. "Feb 26". For date ranges use the CLOSING date.
 - "type": one of: "exam", "midterm", "final exam", "quiz", "project", "lab", "assignment", "paper", "presentation", "homework"
-- "description": concise name of the assignment, max 80 chars (e.g. "Quiz 3", "Midterm 1", "Project 2 due")
-- "weight": integer 0-100 representing this item's % of final grade. If the syllabus says "3 exams @ 60% total", each exam = 20. If not stated, estimate: final exam=35, midterm=20, quiz=8, project=15, lab=5, assignment=5, homework=5.
+- "description": concise name, max 80 chars e.g. "Quiz 3", "Midterm 1", "Project 2"
+- "weight": integer % of final grade. If syllabus says "3 exams = 60% total", each = 20. Estimates if not stated: final exam=35, midterm=20, quiz=8, project=15, lab=5, assignment=5, homework=5
 
 CRITICAL RULES:
-- Read ALL sections carefully: grading tables, course schedules, week-by-week breakdowns, inline prose ("the exam will be on Feb 10")
-- For quizzes/labs that repeat weekly, include EACH ONE with its specific date
-- For exams stated as date ranges (opens Mon, closes Wed), use the CLOSING date
-- If a "Week N" schedule is used and semester starts Jan 20, calculate actual dates (Week 1=Jan 20, Week 2=Jan 27, etc.)
-- Skip: office hours, reading assignments with no grade, attendance-only items, class meetings
-- Do NOT skip: any exam, quiz, project milestone, paper, lab with a due date
-- Return [] if genuinely nothing graded with dates found
+- Read ALL sections: grading tables, schedules, week plans, AND inline prose sentences like "The exam will be on Feb. 10"
+- Exam dates are often stated as prose near the END of the document — read carefully
+- For each quiz/lab that repeats weekly, include EACH ONE with its specific date
+- For date ranges (opens Mon, closes Wed) → use the CLOSING date
+- Skip: office hours, readings with no grade, class meetings with no submission
+- If no specific dates exist (all on Canvas), return []
 
 Syllabus text:
 {chunk}"""
@@ -199,24 +184,37 @@ Syllabus text:
                 'weight': max(1, min(100, int(item.get('weight', 10))))
             })
         except Exception as e:
-            print(f"  [AI parser] Skipping item: {e} — {item}")
+            print(f"  [AI parser] Skipping: {e} — {item}")
 
     return deadlines
 
 
 # ─────────────────────────────────────────
-# Public API
+# Public API — supports multiple files per course
 # ─────────────────────────────────────────
-def parse_syllabus(file_path, course_name, default_year=2026):
-    print(f"Parsing: {file_path}")
+def parse_syllabus(file_paths, course_name, default_year=2026):
+    """
+    file_paths: str (single file) or list of str (multiple files per course)
+    Merges all text from all files before sending to AI.
+    """
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
 
-    text = extract_text(file_path)
+    combined_text = ''
+    for path in file_paths:
+        print(f"  Reading: {path}")
+        text = extract_text(path)
+        if text.strip():
+            combined_text += f'\n\n=== FILE: {os.path.basename(path)} ===\n' + text
+        else:
+            print(f"  -> No text extracted from {path}")
 
-    if not text.strip():
-        print(f"  -> No text extracted from {file_path}")
+    if not combined_text.strip():
+        print(f"  -> No text extracted for {course_name}")
         return []
 
-    deadlines = ai_parse_syllabus(text, course_name, default_year)
+    print(f"Parsing {course_name} ({len(file_paths)} file(s), {len(combined_text)} chars total)...")
+    deadlines = ai_parse_syllabus(combined_text, course_name, default_year)
     deadlines.sort(key=lambda x: x['date'])
 
     print(f"  -> Found {len(deadlines)} deadlines for {course_name}")
